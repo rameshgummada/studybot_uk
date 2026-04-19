@@ -1,0 +1,8 @@
+venv/
+chroma_db/
+studybot.duckdb
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+.env
