@@ -40,15 +40,27 @@ def init_db(con: duckdb.DuckDBPyConnection):
         )
     """)
     con.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            student_id VARCHAR PRIMARY KEY,
+            name       VARCHAR,
+            pin        VARCHAR
+        )
+    """)
+    con.execute("""
         CREATE TABLE IF NOT EXISTS quiz_sessions (
             session_id     VARCHAR PRIMARY KEY,
             subject        VARCHAR,
             topic          VARCHAR,
             question_count INTEGER,
             questions_json TEXT,
-            created_at     TIMESTAMP
+            created_at     TIMESTAMP,
+            student_id     VARCHAR DEFAULT ''
         )
     """)
+    try:
+        con.execute("ALTER TABLE quiz_sessions ADD COLUMN student_id VARCHAR DEFAULT ''")
+    except Exception:
+        pass
     con.execute("""
         CREATE TABLE IF NOT EXISTS quiz_results (
             result_id      VARCHAR PRIMARY KEY,

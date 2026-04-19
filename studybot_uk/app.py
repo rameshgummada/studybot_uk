@@ -167,10 +167,31 @@ def get_curriculum(subject: str):
     }
 
 
+SAMPLE_STUDENTS = [
+    ("ST001", "Alice Johnson",  "1234"),
+    ("ST002", "Ben Murphy",     "2345"),
+    ("ST003", "Chloe Davies",   "3456"),
+    ("ST004", "Daniel Smith",   "4567"),
+    ("ST005", "Emma Wilson",    "5678"),
+]
+
+
 def db():
     con = duckdb.connect(DUCKDB_PATH)
     init_db(con)
     return con
+
+
+def seed_students():
+    con = db()
+    for sid, name, pin in SAMPLE_STUDENTS:
+        existing = con.execute("SELECT 1 FROM students WHERE student_id=?", [sid]).fetchone()
+        if not existing:
+            con.execute("INSERT INTO students VALUES (?,?,?)", [sid, name, pin])
+    con.close()
+
+
+seed_students()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -231,10 +252,11 @@ def ingest_all():
 
 @app.post("/quiz/generate")
 def generate_quiz(body: dict):
-    subject = body.get("subject", "chemistry")
-    topic   = body.get("topic", "")
-    count   = int(body.get("count", 10))
-    count   = min(count, 50)
+    subject    = body.get("subject", "chemistry")
+    topic      = body.get("topic", "")
+    count      = int(body.get("count", 10))
+    count      = min(count, 50)
+    student_id = body.get("student_id", "")
 
     context = search_context(subject, topic, n=15)
     ctx_block = f"\nReference material from study documents:\n{context}\n" if context else \
@@ -269,8 +291,10 @@ For non-mcq questions omit "options". Include "marks" (1-4) for each question.""
     session_id = str(uuid.uuid4())
     con = db()
     con.execute(
-        "INSERT INTO quiz_sessions VALUES (?,?,?,?,?,?)",
-        [session_id, subject, topic, count, json.dumps(questions), datetime.now()]
+        """INSERT INTO quiz_sessions
+           (session_id,subject,topic,question_count,questions_json,created_at,student_id)
+           VALUES (?,?,?,?,?,?,?)""",
+        [session_id, subject, topic, count, json.dumps(questions), datetime.now(), student_id]
     )
     con.close()
     return {"session_id": session_id, "questions": questions, "subject": subject, "topic": topic}
@@ -418,6 +442,75 @@ Include specific CCEA GCSE values, units, equations and real examples. Write in 
     return {"subject": subject, "unit": unit, "topic": topic, "notes": notes}
 
 
+@app.post("/login")
+def login(body: dict):
+    sid  = body.get("student_id", "").strip().upper()
+    pin  = body.get("pin", "").strip()
+    con  = db()
+    row  = con.execute(
+        "SELECT name FROM students WHERE student_id=? AND pin=?", [sid, pin]
+    ).fetchone()
+    con.close()
+    if row:
+        return {"success": True, "student_id": sid, "name": row[0]}
+    return {"success": False, "error": "Invalid Student ID or PIN"}
+
+
+@app.get("/performance/{student_id}")
+def get_performance(student_id: str):
+    con = db()
+    rows = con.execute("""
+        SELECT qs.created_at, qs.subject, qs.topic, qs.question_count,
+               COUNT(qr.result_id)                                           AS answered,
+               SUM(CASE WHEN qr.is_correct THEN 1 ELSE 0 END)               AS correct
+        FROM   quiz_sessions qs
+        LEFT JOIN quiz_results qr ON qs.session_id = qr.session_id
+        WHERE  qs.student_id = ?
+        GROUP  BY qs.session_id, qs.created_at, qs.subject, qs.topic, qs.question_count
+        ORDER  BY qs.created_at DESC
+    """, [student_id]).fetchall()
+    con.close()
+
+    results = []
+    for r in rows:
+        answered  = int(r[4] or 0)
+        correct   = int(r[5] or 0)
+        score_pct = round(correct / answered * 100) if answered > 0 else 0
+        results.append({
+            "date":       str(r[0])[:16].replace("T", " "),
+            "subject":    r[1],
+            "topic":      r[2] or "General Revision",
+            "questions":  r[3],
+            "answered":   answered,
+            "correct":    correct,
+            "score_pct":  score_pct,
+        })
+
+    subj_totals: dict = {}
+    for r in results:
+        s = r["subject"]
+        if s not in subj_totals:
+            subj_totals[s] = {"answered": 0, "correct": 0, "sessions": 0}
+        subj_totals[s]["answered"]  += r["answered"]
+        subj_totals[s]["correct"]   += r["correct"]
+        subj_totals[s]["sessions"]  += 1
+
+    subject_avg = {
+        k: round(v["correct"] / v["answered"] * 100) if v["answered"] > 0 else 0
+        for k, v in subj_totals.items()
+    }
+    overall = round(sum(r["score_pct"] for r in results) / len(results)) if results else 0
+
+    return {
+        "student_id":      student_id,
+        "results":         results,
+        "subject_stats":   subj_totals,
+        "subject_avg":     subject_avg,
+        "overall_avg":     overall,
+        "total_sessions":  len(results),
+    }
+
+
 @app.get("/stats")
 def stats():
     con = db()
@@ -543,14 +636,64 @@ input[type=text]:focus{border-color:#4fc3f7}
             font-size:13px;color:#555;transition:.2s}
 .topic-chip:hover{border-color:#4fc3f7;color:#0288d1}
 .topic-chip.topic-sel{background:#0288d1;color:white;border-color:#0288d1}
+.login-btn{padding:7px 16px;border-radius:20px;border:2px solid rgba(255,255,255,.3);
+           background:transparent;color:rgba(255,255,255,.85);cursor:pointer;
+           font-size:13px;font-weight:600;transition:.2s}
+.login-btn:hover{border-color:#4fc3f7;color:#4fc3f7}
+.student-badge{display:flex;align-items:center;gap:8px;color:white;font-size:13px}
+.student-name{font-weight:700;color:#4fc3f7}
+.logout-btn{padding:4px 10px;border-radius:12px;border:1.5px solid rgba(255,255,255,.3);
+            background:transparent;color:rgba(255,255,255,.7);cursor:pointer;font-size:12px}
+.logout-btn:hover{border-color:#ef5350;color:#ef5350}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
+               display:flex;align-items:center;justify-content:center}
+.modal-box{background:white;border-radius:14px;padding:30px 28px;width:340px;
+           box-shadow:0 8px 32px rgba(0,0,0,.25)}
+.modal-box h3{margin:0 0 18px;font-size:1.1rem;color:#1a1a2e}
+.modal-input{width:100%;padding:10px 13px;border:1.5px solid #ddd;border-radius:8px;
+             font-size:14px;margin-bottom:10px;outline:none;box-sizing:border-box}
+.modal-input:focus{border-color:#4fc3f7}
+.modal-hint{background:#f0f8ff;border-radius:8px;padding:10px 12px;font-size:12px;
+            color:#555;margin-bottom:14px;line-height:1.6}
+.modal-hint b{color:#0288d1}
+.modal-err{color:#ef5350;font-size:13px;margin-bottom:8px;min-height:18px}
+.perf-stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px;margin-bottom:20px}
+.perf-stat{background:white;border-radius:10px;padding:16px;box-shadow:0 2px 6px rgba(0,0,0,.07);text-align:center}
+.perf-stat-val{font-size:1.8rem;font-weight:800;color:#1a1a2e;line-height:1}
+.perf-stat-lbl{font-size:12px;color:#888;margin-top:4px;font-weight:600}
+.subj-bar-row{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.subj-bar-label{width:90px;font-size:13px;font-weight:600;color:#1a1a2e;text-align:right}
+.subj-bar-track{flex:1;height:14px;background:#e0e0e0;border-radius:7px;overflow:hidden}
+.subj-bar-fill{height:100%;border-radius:7px;transition:width 1s}
+.subj-bar-pct{width:38px;font-size:13px;font-weight:700;color:#1a1a2e}
+.perf-table{width:100%;border-collapse:collapse;font-size:13px}
+.perf-table th{background:#f8f9ff;padding:9px 12px;text-align:left;font-weight:700;
+               color:#3949ab;border-bottom:2px solid #e8ecff}
+.perf-table td{padding:9px 12px;border-bottom:1px solid #f0f0f0;vertical-align:middle}
+.perf-table tr:hover td{background:#fafbff}
+.grade-badge{display:inline-block;padding:3px 9px;border-radius:10px;font-size:11px;font-weight:700}
+.grade-a{background:#e8f5e9;color:#2e7d32}
+.grade-b{background:#e3f2fd;color:#1565c0}
+.grade-c{background:#fff3e0;color:#e65100}
+.grade-d{background:#fce4ec;color:#c62828}
 </style>
 </head>
 <body>
-<header>
+<header style="display:flex;align-items:center">
   <span>📚</span>
   <div>
     <h1>StudyBot UK</h1>
     <div style="font-size:12px;color:#aaa">GCSE Revision • Chemistry · Physics · Maths</div>
+  </div>
+  <div style="margin-left:auto">
+    <div id="login-widget">
+      <button class="login-btn" onclick="showLoginModal()">👤 Student Login</button>
+    </div>
+    <div id="student-badge" class="student-badge" style="display:none">
+      <span>👤</span>
+      <span id="student-name-hdr" class="student-name"></span>
+      <button class="logout-btn" onclick="doLogout()">Logout</button>
+    </div>
   </div>
 </header>
 
@@ -570,6 +713,31 @@ input[type=text]:focus{border-color:#4fc3f7}
   <div class="tab" onclick="showPage('notes',this)">📝 Notes</div>
   <div class="tab" onclick="showPage('upload',this)">⬆️ Upload</div>
   <div class="tab" onclick="showPage('stats',this)">📊 Stats</div>
+  <div class="tab" onclick="showPage('perf',this)">📈 Performance</div>
+</div>
+
+<!-- LOGIN MODAL -->
+<div id="login-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)hideLoginModal()">
+  <div class="modal-box">
+    <h3>👤 Student Login</h3>
+    <div class="modal-hint">
+      <b>Sample accounts:</b><br>
+      ST001 Alice Johnson — PIN 1234<br>
+      ST002 Ben Murphy — PIN 2345<br>
+      ST003 Chloe Davies — PIN 3456<br>
+      ST004 Daniel Smith — PIN 4567<br>
+      ST005 Emma Wilson — PIN 5678
+    </div>
+    <input class="modal-input" id="login-id" type="text" placeholder="Student ID (e.g. ST001)" maxlength="5"
+           oninput="this.value=this.value.toUpperCase()">
+    <input class="modal-input" id="login-pin" type="password" placeholder="PIN"
+           maxlength="4" onkeydown="if(event.key==='Enter')doLogin()">
+    <div class="modal-err" id="login-err"></div>
+    <div style="display:flex;gap:10px">
+      <button class="btn btn-primary" style="flex:1" onclick="doLogin()">Login</button>
+      <button class="btn" style="flex:1;background:#eee;color:#555" onclick="hideLoginModal()">Cancel</button>
+    </div>
+  </div>
 </div>
 
 <!-- QUIZ PAGE -->
@@ -690,10 +858,51 @@ input[type=text]:focus{border-color:#4fc3f7}
   </div>
 </div>
 
+<!-- PERFORMANCE PAGE -->
+<div class="page" id="page-perf">
+  <div id="perf-login-notice" class="card" style="text-align:center;padding:40px">
+    <div style="font-size:2.5rem;margin-bottom:12px">📈</div>
+    <h2 style="margin-bottom:8px">Student Performance</h2>
+    <p style="color:#888;margin-bottom:16px;font-size:14px">Please log in to view your performance dashboard.</p>
+    <button class="btn btn-primary" onclick="showLoginModal()">👤 Login</button>
+  </div>
+  <div id="perf-content" style="display:none">
+    <div class="perf-stat-grid" id="perf-stats"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px">
+      <div class="card" style="margin:0">
+        <h2 style="margin-bottom:14px">Performance by Subject</h2>
+        <div id="perf-subj-bars"></div>
+      </div>
+      <div class="card" style="margin:0">
+        <h2 style="margin-bottom:14px">Score Trend</h2>
+        <canvas id="perf-trend-canvas" width="400" height="180"></canvas>
+      </div>
+    </div>
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <h2 style="margin:0">Quiz History</h2>
+        <button class="btn btn-primary" style="font-size:12px;padding:6px 14px" onclick="loadPerformance()">🔄 Refresh</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table class="perf-table" id="perf-table">
+          <thead><tr>
+            <th>Date &amp; Time</th><th>Subject</th><th>Topic</th>
+            <th>Score</th><th>Correct</th><th>Grade</th>
+          </tr></thead>
+          <tbody id="perf-tbody"></tbody>
+        </table>
+      </div>
+      <div id="perf-empty" style="display:none;text-align:center;padding:30px;color:#bbb;font-size:14px">
+        No quizzes completed yet. Take a quiz to see your results here!
+      </div>
+    </div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
-const state = { subject:'chemistry', count:15, sessionId:null, questions:[] };
+const state = { subject:'chemistry', count:15, sessionId:null, questions:[], student:null };
 let ntCurriculum = [];
 
 function selSubject(el, subject){
@@ -742,7 +951,8 @@ async function generateQuiz(){
   try{
     const r=await fetch('/quiz/generate',{
       method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({subject:state.subject,topic,count:state.count})
+      body:JSON.stringify({subject:state.subject,topic,count:state.count,
+                           student_id:state.student?state.student.student_id:''})
     });
     const d=await r.json();
     if(d.error){toast('❌ '+d.error);return;}
@@ -996,6 +1206,175 @@ async function loadStats(){
         ${s.files} file(s) · ${s.chunks} chunks
       </div>`).join('')}`;
   }catch(e){area.innerHTML='<span style="color:red">'+e.message+'</span>';}
+}
+
+// ── LOGIN ─────────────────────────────────────────────────────────────────────
+function showLoginModal(){
+  document.getElementById('login-modal').style.display='flex';
+  document.getElementById('login-id').focus();
+  document.getElementById('login-err').innerText='';
+}
+function hideLoginModal(){
+  document.getElementById('login-modal').style.display='none';
+}
+async function doLogin(){
+  const sid = document.getElementById('login-id').value.trim().toUpperCase();
+  const pin = document.getElementById('login-pin').value.trim();
+  if(!sid||!pin){ document.getElementById('login-err').innerText='Enter Student ID and PIN.'; return; }
+  try{
+    const r = await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
+                                    body:JSON.stringify({student_id:sid,pin})});
+    const d = await r.json();
+    if(d.success){
+      state.student = {student_id:d.student_id, name:d.name};
+      document.getElementById('login-widget').style.display='none';
+      document.getElementById('student-badge').style.display='flex';
+      document.getElementById('student-name-hdr').innerText=d.name;
+      document.getElementById('login-pin').value='';
+      hideLoginModal();
+      toast('Welcome, '+d.name+'!');
+      // refresh performance if on that tab
+      if(document.getElementById('page-perf').classList.contains('active')) loadPerformance();
+    } else {
+      document.getElementById('login-err').innerText = d.error || 'Login failed.';
+    }
+  }catch(e){ document.getElementById('login-err').innerText='Error: '+e.message; }
+}
+function doLogout(){
+  state.student = null;
+  document.getElementById('student-badge').style.display='none';
+  document.getElementById('login-widget').style.display='block';
+  document.getElementById('login-id').value='';
+  document.getElementById('login-pin').value='';
+  document.getElementById('perf-content').style.display='none';
+  document.getElementById('perf-login-notice').style.display='block';
+  toast('Logged out.');
+}
+
+// ── PERFORMANCE ───────────────────────────────────────────────────────────────
+function gradeInfo(pct){
+  if(pct>=70) return {label:'A*–A', cls:'grade-a'};
+  if(pct>=55) return {label:'B–C',  cls:'grade-b'};
+  if(pct>=40) return {label:'D–E',  cls:'grade-c'};
+  return            {label:'U',     cls:'grade-d'};
+}
+function subjColor(subj){
+  const m={'chemistry':'#26c6da','physics':'#7986cb','maths_m4':'#66bb6a','maths_m8':'#ffa726'};
+  return m[subj]||'#4fc3f7';
+}
+
+async function loadPerformance(){
+  if(!state.student){
+    document.getElementById('perf-login-notice').style.display='block';
+    document.getElementById('perf-content').style.display='none';
+    return;
+  }
+  document.getElementById('perf-login-notice').style.display='none';
+  document.getElementById('perf-content').style.display='block';
+
+  const r = await fetch('/performance/'+state.student.student_id);
+  const d = await r.json();
+
+  // Stat cards
+  const bestSubj = Object.entries(d.subject_avg||{}).sort((a,b)=>b[1]-a[1])[0];
+  document.getElementById('perf-stats').innerHTML=`
+    <div class="perf-stat">
+      <div class="perf-stat-val">${d.total_sessions}</div>
+      <div class="perf-stat-lbl">Total Quizzes</div>
+    </div>
+    <div class="perf-stat">
+      <div class="perf-stat-val" style="color:${d.overall_avg>=55?'#2e7d32':'#c62828'}">${d.overall_avg}%</div>
+      <div class="perf-stat-lbl">Overall Average</div>
+    </div>
+    <div class="perf-stat">
+      <div class="perf-stat-val" style="font-size:1.1rem">${bestSubj?bestSubj[0].replace('_',' ').toUpperCase():'—'}</div>
+      <div class="perf-stat-lbl">Best Subject</div>
+    </div>
+    <div class="perf-stat">
+      <div class="perf-stat-val">${d.results.reduce((s,r)=>s+r.answered,0)}</div>
+      <div class="perf-stat-lbl">Questions Answered</div>
+    </div>`;
+
+  // Subject bars
+  document.getElementById('perf-subj-bars').innerHTML =
+    Object.entries(d.subject_avg||{}).map(([subj,pct])=>`
+      <div class="subj-bar-row">
+        <div class="subj-bar-label">${subj.replace('_',' ')}</div>
+        <div class="subj-bar-track">
+          <div class="subj-bar-fill" style="width:${pct}%;background:${subjColor(subj)}"></div>
+        </div>
+        <div class="subj-bar-pct">${pct}%</div>
+      </div>`).join('') || '<span style="color:#bbb;font-size:13px">No data yet</span>';
+
+  // Trend mini-chart (canvas sparkline)
+  const scores = d.results.slice().reverse().map(r=>r.score_pct);
+  drawSparkline(scores);
+
+  // Table
+  const tbody = document.getElementById('perf-tbody');
+  if(!d.results.length){
+    tbody.innerHTML='';
+    document.getElementById('perf-empty').style.display='block';
+    document.getElementById('perf-table').style.display='none';
+  } else {
+    document.getElementById('perf-empty').style.display='none';
+    document.getElementById('perf-table').style.display='table';
+    tbody.innerHTML = d.results.map(r=>{
+      const g=gradeInfo(r.score_pct);
+      return `<tr>
+        <td style="color:#888;white-space:nowrap">${r.date}</td>
+        <td><span style="font-weight:600;color:${subjColor(r.subject)}">${r.subject.replace('_',' ').toUpperCase()}</span></td>
+        <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${r.topic}</td>
+        <td><b>${r.correct}/${r.answered}</b></td>
+        <td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div style="width:60px;height:8px;background:#eee;border-radius:4px;overflow:hidden">
+              <div style="width:${r.score_pct}%;height:100%;background:${subjColor(r.subject)};border-radius:4px"></div>
+            </div>
+            <b>${r.score_pct}%</b>
+          </div>
+        </td>
+        <td><span class="grade-badge ${g.cls}">${g.label}</span></td>
+      </tr>`;}).join('');
+  }
+}
+
+function drawSparkline(scores){
+  const canvas = document.getElementById('perf-trend-canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  if(!scores.length){ ctx.fillStyle='#bbb'; ctx.font='13px sans-serif';
+    ctx.fillText('No data yet',140,95); return; }
+  const W=canvas.width, H=canvas.height, pad=24;
+  const n=scores.length, maxV=100, minV=0;
+  const xStep=(W-2*pad)/(Math.max(n-1,1));
+  // grid lines
+  ctx.strokeStyle='#eee'; ctx.lineWidth=1;
+  [0,25,50,75,100].forEach(v=>{
+    const y=pad+(H-2*pad)*(1-v/100);
+    ctx.beginPath(); ctx.moveTo(pad,y); ctx.lineTo(W-pad,y); ctx.stroke();
+    ctx.fillStyle='#bbb'; ctx.font='10px sans-serif'; ctx.fillText(v+'%',2,y+4);
+  });
+  // line
+  ctx.beginPath(); ctx.strokeStyle='#4fc3f7'; ctx.lineWidth=2.5;
+  scores.forEach((v,i)=>{
+    const x=pad+i*xStep, y=pad+(H-2*pad)*(1-v/100);
+    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+  // dots
+  scores.forEach((v,i)=>{
+    const x=pad+i*xStep, y=pad+(H-2*pad)*(1-v/100);
+    ctx.beginPath(); ctx.arc(x,y,4,0,2*Math.PI);
+    ctx.fillStyle=v>=55?'#66bb6a':'#ef5350'; ctx.fill();
+  });
+}
+
+// auto-load performance when tab is opened
+const _origShowPage = showPage;
+function showPage(name,tab){
+  _origShowPage(name,tab);
+  if(name==='perf') loadPerformance();
 }
 </script>
 </body>
