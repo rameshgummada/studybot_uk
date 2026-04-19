@@ -922,6 +922,7 @@ function showPage(name, tab){
   document.getElementById('page-'+name).classList.add('active');
   tab.classList.add('active');
   if(name==='notes') loadUnits();
+  if(name==='perf')  loadPerformance();
 }
 
 function selPill(el, groupId, val){
@@ -1370,12 +1371,6 @@ function drawSparkline(scores){
   });
 }
 
-// auto-load performance when tab is opened
-const _origShowPage = showPage;
-function showPage(name,tab){
-  _origShowPage(name,tab);
-  if(name==='perf') loadPerformance();
-}
 </script>
 </body>
 </html>"""
