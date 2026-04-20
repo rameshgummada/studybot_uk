@@ -39,11 +39,38 @@ def init_db(con: duckdb.DuckDBPyConnection):
             ingested_at  TIMESTAMP
         )
     """)
+    # Migrate from old PIN-based schema if needed, then create/ensure new schema
+    try:
+        con.execute("SELECT password_hash FROM students LIMIT 0")
+    except Exception:
+        try:
+            con.execute("ALTER TABLE students RENAME TO students_v1_backup")
+        except Exception:
+            pass
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS students (
+                student_id    VARCHAR PRIMARY KEY,
+                first_name    VARCHAR,
+                last_name     VARCHAR,
+                email         VARCHAR,
+                date_of_birth DATE,
+                school_year   INTEGER,
+                password_hash VARCHAR,
+                is_active     BOOLEAN DEFAULT TRUE,
+                gdpr_consent  BOOLEAN DEFAULT TRUE,
+                consent_date  TIMESTAMP,
+                created_at    TIMESTAMP
+            )
+        """)
     con.execute("""
-        CREATE TABLE IF NOT EXISTS students (
-            student_id VARCHAR PRIMARY KEY,
-            name       VARCHAR,
-            pin        VARCHAR
+        CREATE TABLE IF NOT EXISTS parent_consent (
+            consent_id    VARCHAR PRIMARY KEY,
+            student_id    VARCHAR,
+            parent_name   VARCHAR,
+            parent_email  VARCHAR,
+            parent_phone  VARCHAR,
+            consent_given BOOLEAN DEFAULT FALSE,
+            consent_date  TIMESTAMP
         )
     """)
     con.execute("""

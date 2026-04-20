@@ -1,5 +1,5 @@
-import os, json, uuid, shutil, tempfile
-from datetime import datetime
+import os, json, uuid, shutil, tempfile, hashlib, secrets, random, string
+from datetime import datetime, date
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 import anthropic
@@ -168,12 +168,34 @@ def get_curriculum(subject: str):
 
 
 SAMPLE_STUDENTS = [
-    ("ST001", "Alice Johnson",  "1234"),
-    ("ST002", "Ben Murphy",     "2345"),
-    ("ST003", "Chloe Davies",   "3456"),
-    ("ST004", "Daniel Smith",   "4567"),
-    ("ST005", "Emma Wilson",    "5678"),
+    {"sid": "ST000001", "first": "Alice",  "last": "Johnson", "email": "alice@demo.studybot.uk",  "dob": "2009-03-15", "year": 11},
+    {"sid": "ST000002", "first": "Ben",    "last": "Murphy",  "email": "ben@demo.studybot.uk",    "dob": "2008-07-22", "year": 11},
+    {"sid": "ST000003", "first": "Chloe",  "last": "Davies",  "email": "chloe@demo.studybot.uk",  "dob": "2008-11-08", "year": 11},
+    {"sid": "ST000004", "first": "Daniel", "last": "Smith",   "email": "daniel@demo.studybot.uk", "dob": "2008-02-14", "year": 11},
+    {"sid": "ST000005", "first": "Emma",   "last": "Wilson",  "email": "emma@demo.studybot.uk",   "dob": "2009-09-30", "year": 11},
 ]
+_DEMO_PASSWORD = "Study123!"
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    pw_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260000).hex()
+    return f"{salt}:{pw_hash}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, pw_hash = stored.split(":", 1)
+        return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260000).hex() == pw_hash
+    except Exception:
+        return False
+
+
+def generate_student_id(con) -> str:
+    while True:
+        sid = "ST" + "".join(random.choices(string.digits, k=6))
+        if not con.execute("SELECT 1 FROM students WHERE student_id=?", [sid]).fetchone():
+            return sid
 
 
 def db():
@@ -184,10 +206,15 @@ def db():
 
 def seed_students():
     con = db()
-    for sid, name, pin in SAMPLE_STUDENTS:
-        existing = con.execute("SELECT 1 FROM students WHERE student_id=?", [sid]).fetchone()
-        if not existing:
-            con.execute("INSERT INTO students VALUES (?,?,?)", [sid, name, pin])
+    now = datetime.now()
+    for s in SAMPLE_STUDENTS:
+        if not con.execute("SELECT 1 FROM students WHERE student_id=?", [s["sid"]]).fetchone():
+            ph = hash_password(_DEMO_PASSWORD)
+            con.execute("""
+                INSERT INTO students (student_id, first_name, last_name, email, date_of_birth, school_year,
+                                     password_hash, is_active, gdpr_consent, consent_date, created_at)
+                VALUES (?,?,?,?,?,?,?,TRUE,TRUE,?,?)
+            """, [s["sid"], s["first"], s["last"], s["email"], s["dob"], s["year"], ph, now, now])
     con.close()
 
 
@@ -444,31 +471,136 @@ Include specific CCEA GCSE values, units, equations and real examples. Write in 
 
 @app.post("/login")
 def login(body: dict):
-    sid  = body.get("student_id", "").strip().upper()
-    pin  = body.get("pin", "").strip()
-    con  = db()
-    row  = con.execute(
-        "SELECT name FROM students WHERE student_id=? AND pin=?", [sid, pin]
+    identifier = body.get("student_id", "").strip()
+    password   = body.get("password", "").strip()
+
+    con = db()
+    row = con.execute(
+        "SELECT student_id, first_name, last_name, password_hash FROM students WHERE UPPER(student_id)=? AND is_active=TRUE",
+        [identifier.upper()]
     ).fetchone()
+    if not row:
+        row = con.execute(
+            "SELECT student_id, first_name, last_name, password_hash FROM students WHERE LOWER(email)=? AND is_active=TRUE",
+            [identifier.lower()]
+        ).fetchone()
     con.close()
-    if row:
-        return {"success": True, "student_id": sid, "name": row[0]}
-    return {"success": False, "error": "Invalid Student ID or PIN"}
+
+    if row and verify_password(password, row[3]):
+        return {"success": True, "student_id": row[0], "name": f"{row[1]} {row[2]}"}
+    return {"success": False, "error": "Invalid Student ID/email or password"}
+
+
+@app.post("/register")
+def register_student(body: dict):
+    first_name   = body.get("first_name",    "").strip()
+    last_name    = body.get("last_name",     "").strip()
+    email        = body.get("email",         "").strip().lower()
+    dob_str      = body.get("date_of_birth", "").strip()
+    school_year  = int(body.get("school_year", 10))
+    password     = body.get("password",      "").strip()
+    gdpr_consent = body.get("gdpr_consent",  False)
+
+    parent_name    = body.get("parent_name",    "").strip()
+    parent_email   = body.get("parent_email",   "").strip().lower()
+    parent_phone   = body.get("parent_phone",   "").strip()
+    parent_consent = body.get("parent_consent", False)
+
+    if not all([first_name, last_name, email, dob_str, password]):
+        return {"success": False, "error": "All required fields must be filled in."}
+    if not gdpr_consent:
+        return {"success": False, "error": "You must accept the GDPR privacy notice to register."}
+    if len(password) < 8:
+        return {"success": False, "error": "Password must be at least 8 characters."}
+
+    try:
+        dob_date = date.fromisoformat(dob_str)
+    except ValueError:
+        return {"success": False, "error": "Invalid date of birth."}
+
+    today = date.today()
+    age = today.year - dob_date.year - ((today.month, today.day) < (dob_date.month, dob_date.day))
+
+    if age < 13:
+        return {"success": False, "error": "You must be at least 13 years old to register."}
+    if age < 16 and not parent_consent:
+        return {"success": False, "error": "Parental consent is required for students under 16."}
+    if age < 16 and not all([parent_name, parent_email]):
+        return {"success": False, "error": "Parent name and email are required for students under 16."}
+
+    con = db()
+    if con.execute("SELECT 1 FROM students WHERE LOWER(email)=?", [email]).fetchone():
+        con.close()
+        return {"success": False, "error": "This email address is already registered."}
+
+    sid = generate_student_id(con)
+    ph  = hash_password(password)
+    now = datetime.now()
+    con.execute("""
+        INSERT INTO students (student_id, first_name, last_name, email, date_of_birth, school_year,
+                              password_hash, is_active, gdpr_consent, consent_date, created_at)
+        VALUES (?,?,?,?,?,?,?,TRUE,TRUE,?,?)
+    """, [sid, first_name, last_name, email, dob_date, school_year, ph, now, now])
+
+    if age < 16 and parent_consent:
+        con.execute("""
+            INSERT INTO parent_consent (consent_id, student_id, parent_name, parent_email, parent_phone, consent_given, consent_date)
+            VALUES (?,?,?,?,?,TRUE,?)
+        """, [str(uuid.uuid4()), sid, parent_name, parent_email, parent_phone, now])
+
+    con.close()
+    return {"success": True, "student_id": sid, "name": f"{first_name} {last_name}"}
+
+
+@app.delete("/account/{student_id}")
+def delete_account(student_id: str):
+    con = db()
+    con.execute("DELETE FROM parent_consent WHERE student_id=?", [student_id])
+    con.execute("UPDATE quiz_sessions SET student_id='' WHERE student_id=?", [student_id])
+    con.execute("DELETE FROM students WHERE student_id=?", [student_id])
+    con.close()
+    return {"success": True, "message": "Account deleted. Quiz history anonymised."}
 
 
 @app.get("/performance/{student_id}")
 def get_performance(student_id: str):
     con = db()
+
     rows = con.execute("""
         SELECT qs.created_at, qs.subject, qs.topic, qs.question_count,
-               COUNT(qr.result_id)                                           AS answered,
-               SUM(CASE WHEN qr.is_correct THEN 1 ELSE 0 END)               AS correct
+               COUNT(qr.result_id)                                         AS answered,
+               SUM(CASE WHEN qr.is_correct THEN 1 ELSE 0 END)             AS correct
         FROM   quiz_sessions qs
         LEFT JOIN quiz_results qr ON qs.session_id = qr.session_id
         WHERE  qs.student_id = ?
         GROUP  BY qs.session_id, qs.created_at, qs.subject, qs.topic, qs.question_count
         ORDER  BY qs.created_at DESC
     """, [student_id]).fetchall()
+
+    daily_rows = con.execute("""
+        SELECT CAST(qs.created_at AS DATE)                                 AS day,
+               COUNT(DISTINCT qs.session_id)                               AS sessions,
+               COUNT(qr.result_id)                                         AS answered,
+               SUM(CASE WHEN qr.is_correct THEN 1 ELSE 0 END)             AS correct
+        FROM   quiz_sessions qs
+        LEFT JOIN quiz_results qr ON qs.session_id = qr.session_id
+        WHERE  qs.student_id = ?
+        GROUP  BY CAST(qs.created_at AS DATE)
+        ORDER  BY day DESC
+    """, [student_id]).fetchall()
+
+    monthly_rows = con.execute("""
+        SELECT substr(CAST(CAST(qs.created_at AS DATE) AS VARCHAR), 1, 7) AS month,
+               COUNT(DISTINCT qs.session_id)                               AS sessions,
+               COUNT(qr.result_id)                                         AS answered,
+               SUM(CASE WHEN qr.is_correct THEN 1 ELSE 0 END)             AS correct
+        FROM   quiz_sessions qs
+        LEFT JOIN quiz_results qr ON qs.session_id = qr.session_id
+        WHERE  qs.student_id = ?
+        GROUP  BY substr(CAST(CAST(qs.created_at AS DATE) AS VARCHAR), 1, 7)
+        ORDER  BY month DESC
+    """, [student_id]).fetchall()
+
     con.close()
 
     results = []
@@ -477,23 +609,37 @@ def get_performance(student_id: str):
         correct   = int(r[5] or 0)
         score_pct = round(correct / answered * 100) if answered > 0 else 0
         results.append({
-            "date":       str(r[0])[:16].replace("T", " "),
-            "subject":    r[1],
-            "topic":      r[2] or "General Revision",
-            "questions":  r[3],
-            "answered":   answered,
-            "correct":    correct,
-            "score_pct":  score_pct,
+            "date":      str(r[0])[:16].replace("T", " "),
+            "subject":   r[1],
+            "topic":     r[2] or "General Revision",
+            "questions": r[3],
+            "answered":  answered,
+            "correct":   correct,
+            "score_pct": score_pct,
         })
+
+    def _agg(rows_in):
+        out = []
+        for r in rows_in:
+            answered  = int(r[2] or 0)
+            correct   = int(r[3] or 0)
+            out.append({
+                "label":    str(r[0]),
+                "sessions": int(r[1]),
+                "answered": answered,
+                "correct":  correct,
+                "score_pct": round(correct / answered * 100) if answered > 0 else 0,
+            })
+        return out
 
     subj_totals: dict = {}
     for r in results:
         s = r["subject"]
         if s not in subj_totals:
             subj_totals[s] = {"answered": 0, "correct": 0, "sessions": 0}
-        subj_totals[s]["answered"]  += r["answered"]
-        subj_totals[s]["correct"]   += r["correct"]
-        subj_totals[s]["sessions"]  += 1
+        subj_totals[s]["answered"] += r["answered"]
+        subj_totals[s]["correct"]  += r["correct"]
+        subj_totals[s]["sessions"] += 1
 
     subject_avg = {
         k: round(v["correct"] / v["answered"] * 100) if v["answered"] > 0 else 0
@@ -504,6 +650,8 @@ def get_performance(student_id: str):
     return {
         "student_id":      student_id,
         "results":         results,
+        "daily_results":   _agg(daily_rows),
+        "monthly_results": _agg(monthly_rows),
         "subject_stats":   subj_totals,
         "subject_avg":     subject_avg,
         "overall_avg":     overall,
@@ -676,6 +824,23 @@ input[type=text]:focus{border-color:#4fc3f7}
 .grade-b{background:#e3f2fd;color:#1565c0}
 .grade-c{background:#fff3e0;color:#e65100}
 .grade-d{background:#fce4ec;color:#c62828}
+.modal-tabs{display:flex;border-bottom:2px solid #eee;margin:-4px -4px 18px;gap:0}
+.modal-tab{flex:1;padding:11px;text-align:center;cursor:pointer;font-weight:600;font-size:14px;
+           color:#888;border-bottom:3px solid transparent;transition:.2s;margin-bottom:-2px}
+.modal-tab:hover{color:#0288d1}
+.modal-tab.active{color:#0288d1;border-bottom-color:#0288d1}
+.modal-tab-pane{display:none}
+.modal-tab-pane.active{display:block}
+.gdpr-notice{background:#f0f8ff;border:1px solid #b3e5fc;border-radius:8px;padding:10px 12px;
+             font-size:11px;color:#444;line-height:1.65;margin-bottom:10px;
+             max-height:110px;overflow-y:auto}
+.required-star{color:#ef5350}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.parent-section{background:#fff3e0;border:1.5px solid #ffb74d;border-radius:8px;padding:12px;margin-top:8px}
+.perf-sub-tabs{display:flex;gap:0;margin-bottom:14px;background:#f0f2f5;border-radius:8px;padding:3px}
+.perf-sub-tab{flex:1;padding:7px;text-align:center;cursor:pointer;font-size:13px;font-weight:600;
+              color:#888;border-radius:6px;transition:.2s}
+.perf-sub-tab.active{background:white;color:#0288d1;box-shadow:0 1px 4px rgba(0,0,0,.1)}
 </style>
 </head>
 <body>
@@ -716,26 +881,118 @@ input[type=text]:focus{border-color:#4fc3f7}
   <div class="tab" onclick="showPage('perf',this)">📈 Performance</div>
 </div>
 
-<!-- LOGIN MODAL -->
+<!-- AUTH MODAL -->
 <div id="login-modal" class="modal-overlay" style="display:none" onclick="if(event.target===this)hideLoginModal()">
-  <div class="modal-box">
-    <h3>👤 Student Login</h3>
-    <div class="modal-hint">
-      <b>Sample accounts:</b><br>
-      ST001 Alice Johnson — PIN 1234<br>
-      ST002 Ben Murphy — PIN 2345<br>
-      ST003 Chloe Davies — PIN 3456<br>
-      ST004 Daniel Smith — PIN 4567<br>
-      ST005 Emma Wilson — PIN 5678
+  <div class="modal-box" style="width:500px;max-height:88vh;overflow-y:auto;padding:22px 24px">
+    <div class="modal-tabs">
+      <div class="modal-tab active" id="mtab-login" onclick="switchAuthTab('login')">👤 Login</div>
+      <div class="modal-tab" id="mtab-register" onclick="switchAuthTab('register')">📝 Register</div>
     </div>
-    <input class="modal-input" id="login-id" type="text" placeholder="Student ID (e.g. ST001)" maxlength="5"
-           oninput="this.value=this.value.toUpperCase()">
-    <input class="modal-input" id="login-pin" type="password" placeholder="PIN"
-           maxlength="4" onkeydown="if(event.key==='Enter')doLogin()">
-    <div class="modal-err" id="login-err"></div>
-    <div style="display:flex;gap:10px">
-      <button class="btn btn-primary" style="flex:1" onclick="doLogin()">Login</button>
-      <button class="btn" style="flex:1;background:#eee;color:#555" onclick="hideLoginModal()">Cancel</button>
+
+    <!-- LOGIN TAB -->
+    <div class="modal-tab-pane active" id="mpane-login">
+      <div class="modal-hint">
+        <b>Demo accounts</b> — password: <b>Study123!</b><br>
+        ST000001 — Alice Johnson &nbsp;|&nbsp; ST000002 — Ben Murphy<br>
+        ST000003 — Chloe Davies &nbsp;|&nbsp; ST000004 — Daniel Smith
+      </div>
+      <input class="modal-input" id="login-id" type="text" placeholder="Student ID (e.g. ST000001) or email"
+             onkeydown="if(event.key==='Enter')doLogin()">
+      <input class="modal-input" id="login-pin" type="password" placeholder="Password"
+             onkeydown="if(event.key==='Enter')doLogin()">
+      <div class="modal-err" id="login-err"></div>
+      <div style="display:flex;gap:10px">
+        <button class="btn btn-primary" style="flex:1" onclick="doLogin()">Login</button>
+        <button class="btn" style="flex:1;background:#eee;color:#555" onclick="hideLoginModal()">Cancel</button>
+      </div>
+      <div style="text-align:center;margin-top:12px;font-size:13px;color:#888">
+        New student? <a href="#" onclick="switchAuthTab('register');return false" style="color:#0288d1;font-weight:600">Register here</a>
+      </div>
+    </div>
+
+    <!-- REGISTER TAB -->
+    <div class="modal-tab-pane" id="mpane-register">
+      <div class="form-row">
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#555">First Name <span class="required-star">*</span></label>
+          <input class="modal-input" id="reg-first" type="text" placeholder="First name" style="margin-top:4px">
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#555">Last Name <span class="required-star">*</span></label>
+          <input class="modal-input" id="reg-last" type="text" placeholder="Last name" style="margin-top:4px">
+        </div>
+      </div>
+      <label style="font-size:12px;font-weight:600;color:#555;display:block;margin-bottom:4px">Email <span class="required-star">*</span></label>
+      <input class="modal-input" id="reg-email" type="email" placeholder="your@email.com">
+      <div class="form-row" style="margin-top:8px">
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#555">Date of Birth <span class="required-star">*</span></label>
+          <input class="modal-input" id="reg-dob" type="date" style="margin-top:4px" onchange="checkAge()">
+        </div>
+        <div>
+          <label style="font-size:12px;font-weight:600;color:#555">School Year <span class="required-star">*</span></label>
+          <select class="modal-input" id="reg-year" style="margin-top:4px">
+            <option value="10">Year 10</option>
+            <option value="11">Year 11</option>
+            <option value="12">Year 12 / AS</option>
+          </select>
+        </div>
+      </div>
+      <label style="font-size:12px;font-weight:600;color:#555;display:block;margin-top:8px;margin-bottom:4px">
+        Password <span class="required-star">*</span> <small style="color:#aaa;font-weight:400">(min 8 characters)</small>
+      </label>
+      <input class="modal-input" id="reg-pw" type="password" placeholder="Create a password">
+      <input class="modal-input" id="reg-pw2" type="password" placeholder="Confirm password" style="margin-top:8px">
+
+      <div class="gdpr-notice" style="margin-top:12px">
+        <b>📋 Privacy Notice (UK GDPR)</b><br>
+        StudyBot UK collects your name, email and date of birth to manage your account and track revision progress.
+        Your data is stored locally and is not shared with third parties. You have the right to access, rectify or
+        erase your personal data at any time (contact your teacher or delete your account in settings).
+        For students under 16, parental/guardian consent is required under UK GDPR Article 8.
+        Data will be retained for the duration of your studies.
+      </div>
+      <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;cursor:pointer;margin-bottom:10px">
+        <input type="checkbox" id="reg-gdpr" style="margin-top:2px;min-width:16px;height:16px">
+        <span>I have read and agree to the <b>Privacy Notice</b> above <span class="required-star">*</span></span>
+      </label>
+
+      <!-- Parental consent (shown when age < 16) -->
+      <div id="parent-section" class="parent-section" style="display:none">
+        <div style="font-weight:700;font-size:13px;color:#e65100;margin-bottom:8px">
+          👨‍👩‍👧 Parental Consent Required (under 16)
+        </div>
+        <p style="font-size:12px;color:#666;margin-bottom:10px;line-height:1.5">
+          As you are under 16, a parent or guardian must give consent for you to use this service (UK GDPR Article 8).
+        </p>
+        <div class="form-row">
+          <div>
+            <label style="font-size:12px;font-weight:600;color:#555">Parent/Guardian Name <span class="required-star">*</span></label>
+            <input class="modal-input" id="reg-parent-name" type="text" placeholder="Full name" style="margin-top:4px">
+          </div>
+          <div>
+            <label style="font-size:12px;font-weight:600;color:#555">Parent Email <span class="required-star">*</span></label>
+            <input class="modal-input" id="reg-parent-email" type="email" placeholder="parent@email.com" style="margin-top:4px">
+          </div>
+        </div>
+        <label style="font-size:12px;font-weight:600;color:#555;display:block;margin-top:6px;margin-bottom:4px">Parent Phone (optional)</label>
+        <input class="modal-input" id="reg-parent-phone" type="tel" placeholder="+44 7700 000000">
+        <label style="display:flex;align-items:flex-start;gap:8px;font-size:13px;cursor:pointer;margin-top:10px">
+          <input type="checkbox" id="reg-parent-consent" style="margin-top:2px;min-width:16px;height:16px">
+          <span>I am the parent/guardian and I give consent for this student to use StudyBot UK <span class="required-star">*</span></span>
+        </label>
+      </div>
+
+      <div class="modal-err" id="reg-err" style="margin-top:10px"></div>
+      <div id="reg-success" style="display:none;background:#e8f5e9;border-radius:8px;padding:12px;margin-top:10px;font-size:13px;line-height:1.6">
+        <b style="color:#2e7d32">✅ Registration successful!</b><br>
+        Your Student ID: <b id="reg-student-id" style="font-size:1.15rem;color:#1565c0;letter-spacing:1px"></b><br>
+        <small style="color:#666">Please save this ID — you need it to log in. You can now log in using the Login tab.</small>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:12px">
+        <button class="btn btn-primary" style="flex:1" id="reg-btn" onclick="doRegister()">📝 Create Account</button>
+        <button class="btn" style="flex:1;background:#eee;color:#555" onclick="hideLoginModal()">Cancel</button>
+      </div>
     </div>
   </div>
 </div>
@@ -883,17 +1140,50 @@ input[type=text]:focus{border-color:#4fc3f7}
         <h2 style="margin:0">Quiz History</h2>
         <button class="btn btn-primary" style="font-size:12px;padding:6px 14px" onclick="loadPerformance()">🔄 Refresh</button>
       </div>
-      <div style="overflow-x:auto">
-        <table class="perf-table" id="perf-table">
-          <thead><tr>
-            <th>Date &amp; Time</th><th>Subject</th><th>Topic</th>
-            <th>Score</th><th>Correct</th><th>Grade</th>
-          </tr></thead>
-          <tbody id="perf-tbody"></tbody>
-        </table>
+      <div class="perf-sub-tabs">
+        <div class="perf-sub-tab active" onclick="switchPerfTab('all',this)">All Sessions</div>
+        <div class="perf-sub-tab" onclick="switchPerfTab('day',this)">By Day</div>
+        <div class="perf-sub-tab" onclick="switchPerfTab('month',this)">By Month</div>
       </div>
-      <div id="perf-empty" style="display:none;text-align:center;padding:30px;color:#bbb;font-size:14px">
-        No quizzes completed yet. Take a quiz to see your results here!
+
+      <!-- All sessions -->
+      <div id="perf-view-all">
+        <div style="overflow-x:auto">
+          <table class="perf-table" id="perf-table">
+            <thead><tr>
+              <th>Date &amp; Time</th><th>Subject</th><th>Topic</th>
+              <th>Score</th><th>Correct</th><th>Grade</th>
+            </tr></thead>
+            <tbody id="perf-tbody"></tbody>
+          </table>
+        </div>
+        <div id="perf-empty" style="display:none;text-align:center;padding:30px;color:#bbb;font-size:14px">
+          No quizzes completed yet. Take a quiz to see your results here!
+        </div>
+      </div>
+
+      <!-- By day -->
+      <div id="perf-view-day" style="display:none">
+        <div style="overflow-x:auto">
+          <table class="perf-table">
+            <thead><tr>
+              <th>Date</th><th>Sessions</th><th>Correct</th><th>Score</th><th>Grade</th>
+            </tr></thead>
+            <tbody id="perf-day-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- By month -->
+      <div id="perf-view-month" style="display:none">
+        <div style="overflow-x:auto">
+          <table class="perf-table">
+            <thead><tr>
+              <th>Month</th><th>Sessions</th><th>Correct</th><th>Score</th><th>Grade</th>
+            </tr></thead>
+            <tbody id="perf-month-tbody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
@@ -1168,7 +1458,7 @@ async function uploadFiles(){
     log.innerHTML+=`<div>⏳ Uploading ${file.name}…</div>`;
     const fd=new FormData();
     fd.append('file',file);
-    fd.append('subject',state.upSubject);
+    fd.append('subject',state.subject);
     try{
       const r=await fetch('/upload',{method:'POST',body:fd});
       const d=await r.json();
@@ -1209,22 +1499,35 @@ async function loadStats(){
   }catch(e){area.innerHTML='<span style="color:red">'+e.message+'</span>';}
 }
 
-// ── LOGIN ─────────────────────────────────────────────────────────────────────
+// ── AUTH MODAL ─────────────────────────────────────────────────────────────────
 function showLoginModal(){
   document.getElementById('login-modal').style.display='flex';
-  document.getElementById('login-id').focus();
+  switchAuthTab('login');
+  setTimeout(()=>document.getElementById('login-id').focus(),50);
   document.getElementById('login-err').innerText='';
 }
 function hideLoginModal(){
   document.getElementById('login-modal').style.display='none';
 }
+function switchAuthTab(tab){
+  document.querySelectorAll('.modal-tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.modal-tab-pane').forEach(p=>p.classList.remove('active'));
+  document.getElementById('mtab-'+tab).classList.add('active');
+  document.getElementById('mpane-'+tab).classList.add('active');
+}
+function checkAge(){
+  const dob = document.getElementById('reg-dob').value;
+  if(!dob) return;
+  const age = Math.floor((Date.now() - new Date(dob)) / (365.25*24*3600*1000));
+  document.getElementById('parent-section').style.display = age < 16 ? 'block' : 'none';
+}
 async function doLogin(){
-  const sid = document.getElementById('login-id').value.trim().toUpperCase();
-  const pin = document.getElementById('login-pin').value.trim();
-  if(!sid||!pin){ document.getElementById('login-err').innerText='Enter Student ID and PIN.'; return; }
+  const sid = document.getElementById('login-id').value.trim();
+  const pw  = document.getElementById('login-pin').value.trim();
+  if(!sid||!pw){ document.getElementById('login-err').innerText='Enter Student ID and password.'; return; }
   try{
     const r = await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},
-                                    body:JSON.stringify({student_id:sid,pin})});
+                                    body:JSON.stringify({student_id:sid,password:pw})});
     const d = await r.json();
     if(d.success){
       state.student = {student_id:d.student_id, name:d.name};
@@ -1234,12 +1537,54 @@ async function doLogin(){
       document.getElementById('login-pin').value='';
       hideLoginModal();
       toast('Welcome, '+d.name+'!');
-      // refresh performance if on that tab
       if(document.getElementById('page-perf').classList.contains('active')) loadPerformance();
     } else {
       document.getElementById('login-err').innerText = d.error || 'Login failed.';
     }
   }catch(e){ document.getElementById('login-err').innerText='Error: '+e.message; }
+}
+async function doRegister(){
+  const btn = document.getElementById('reg-btn');
+  loading(btn,'⏳ Creating account…');
+  document.getElementById('reg-err').innerText='';
+  document.getElementById('reg-success').style.display='none';
+
+  const pw  = document.getElementById('reg-pw').value;
+  const pw2 = document.getElementById('reg-pw2').value;
+  if(pw !== pw2){
+    document.getElementById('reg-err').innerText='Passwords do not match.';
+    done(btn); return;
+  }
+  const body = {
+    first_name:    document.getElementById('reg-first').value.trim(),
+    last_name:     document.getElementById('reg-last').value.trim(),
+    email:         document.getElementById('reg-email').value.trim(),
+    date_of_birth: document.getElementById('reg-dob').value,
+    school_year:   parseInt(document.getElementById('reg-year').value),
+    password:      pw,
+    gdpr_consent:  document.getElementById('reg-gdpr').checked,
+  };
+  const parentSec = document.getElementById('parent-section');
+  if(parentSec.style.display !== 'none'){
+    body.parent_name    = document.getElementById('reg-parent-name').value.trim();
+    body.parent_email   = document.getElementById('reg-parent-email').value.trim();
+    body.parent_phone   = document.getElementById('reg-parent-phone').value.trim();
+    body.parent_consent = document.getElementById('reg-parent-consent').checked;
+  }
+  try{
+    const r = await fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},
+                                        body:JSON.stringify(body)});
+    const d = await r.json();
+    if(d.success){
+      document.getElementById('reg-student-id').innerText = d.student_id;
+      document.getElementById('reg-success').style.display = 'block';
+      btn.style.display = 'none';
+      toast('Account created! Student ID: '+d.student_id);
+    } else {
+      document.getElementById('reg-err').innerText = d.error || 'Registration failed.';
+    }
+  }catch(e){ document.getElementById('reg-err').innerText='Error: '+e.message; }
+  finally{ done(btn); }
 }
 function doLogout(){
   state.student = null;
@@ -1262,6 +1607,14 @@ function gradeInfo(pct){
 function subjColor(subj){
   const m={'chemistry':'#26c6da','physics':'#7986cb','maths_m4':'#66bb6a','maths_m8':'#ffa726'};
   return m[subj]||'#4fc3f7';
+}
+function switchPerfTab(view, el){
+  document.querySelectorAll('.perf-sub-tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  ['all','day','month'].forEach(v=>{
+    const el2=document.getElementById('perf-view-'+v);
+    if(el2) el2.style.display = v===view?'block':'none';
+  });
 }
 
 async function loadPerformance(){
@@ -1307,11 +1660,10 @@ async function loadPerformance(){
         <div class="subj-bar-pct">${pct}%</div>
       </div>`).join('') || '<span style="color:#bbb;font-size:13px">No data yet</span>';
 
-  // Trend mini-chart (canvas sparkline)
-  const scores = d.results.slice().reverse().map(r=>r.score_pct);
-  drawSparkline(scores);
+  // Trend sparkline
+  drawSparkline(d.results.slice().reverse().map(r=>r.score_pct));
 
-  // Table
+  // All sessions table
   const tbody = document.getElementById('perf-tbody');
   if(!d.results.length){
     tbody.innerHTML='';
@@ -1338,6 +1690,35 @@ async function loadPerformance(){
         <td><span class="grade-badge ${g.cls}">${g.label}</span></td>
       </tr>`;}).join('');
   }
+
+  // By-day table
+  function renderAggTable(rows, bodyId){
+    const tb = document.getElementById(bodyId);
+    if(!tb) return;
+    if(!rows.length){
+      tb.innerHTML='<tr><td colspan="5" style="text-align:center;color:#bbb;padding:20px">No data yet</td></tr>';
+      return;
+    }
+    tb.innerHTML = rows.map(r=>{
+      const g=gradeInfo(r.score_pct);
+      return `<tr>
+        <td style="color:#888;white-space:nowrap">${r.label}</td>
+        <td style="font-weight:600">${r.sessions}</td>
+        <td><b>${r.correct}/${r.answered}</b></td>
+        <td>
+          <div style="display:flex;align-items:center;gap:6px">
+            <div style="width:60px;height:8px;background:#eee;border-radius:4px;overflow:hidden">
+              <div style="width:${r.score_pct}%;height:100%;background:#4fc3f7;border-radius:4px"></div>
+            </div>
+            <b>${r.score_pct}%</b>
+          </div>
+        </td>
+        <td><span class="grade-badge ${g.cls}">${g.label}</span></td>
+      </tr>`;
+    }).join('');
+  }
+  renderAggTable(d.daily_results||[],   'perf-day-tbody');
+  renderAggTable(d.monthly_results||[], 'perf-month-tbody');
 }
 
 function drawSparkline(scores){
