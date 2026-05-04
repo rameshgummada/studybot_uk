@@ -285,32 +285,47 @@ def generate_quiz(body: dict):
     count      = min(count, 50)
     student_id = body.get("student_id", "")
 
-    context = search_context(subject, topic, n=15)
-    ctx_block = f"\nReference material from study documents:\n{context}\n" if context else \
-                "\n(No indexed documents found — using general GCSE knowledge)\n"
+    context = search_context(subject, topic or subject, n=20)
+    ctx_block = f"\nExtracted content from indexed past papers and study documents:\n{context}\n" if context else \
+                "\n(No indexed documents — using CCEA GCSE curriculum knowledge)\n"
 
-    prompt = f"""You are a GCSE UK exam question generator.
+    prompt = f"""You are a CCEA GCSE {subject.upper()} examiner setting an exam paper.
 
 Subject: {subject.upper()}
-Topic: {topic if topic else "general revision"}
+Topic: {topic if topic else "general revision — draw from all topics present in the material"}
 Number of questions: {count}
 {ctx_block}
-Generate exactly {count} exam-style questions. Mix types:
-- mcq  = multiple choice (A B C D)
-- short = written short answer
-- calc  = calculation with working
+TASK: Extract or closely adapt exam questions FROM the reference material above.
+Ground every question in facts, values, equations, or examples present in that material.
+Do NOT invent content that is absent from the material.
 
-Return ONLY a JSON array (no markdown, no explanation):
+Use a mix of question types:
+- mcq  = multiple choice with 4 options (A B C D), 1 mark
+- short = written short answer, 1–4 marks
+- calc  = calculation requiring working shown, 2–5 marks
+
+For each question also produce a MARK SCHEME — one bullet per mark, each bullet is the
+minimum keyword or phrase an examiner accepts for that mark.
+
+Return ONLY a JSON array (no markdown, no preamble):
 [
   {{
-    "q": "Full question text",
+    "q": "Full question text as it would appear on the exam paper",
     "type": "mcq|short|calc",
     "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
-    "answer": "correct answer or option letter",
-    "marks": 1
+    "answer": "correct answer text or option letter",
+    "mark_scheme": [
+      "key word / accepted phrase that earns mark 1",
+      "key word / accepted phrase that earns mark 2"
+    ],
+    "marks": 2
   }}
 ]
-For non-mcq questions omit "options". Include "marks" (1-4) for each question."""
+Rules:
+- Omit "options" for short/calc questions.
+- mark_scheme length MUST equal marks.
+- For mcq, mark_scheme = ["Correct: X) <option text>"].
+- marks for mcq = 1, short = 1–4, calc = 2–5."""
 
     raw       = ask_claude(prompt, max_tokens=4000)
     questions = parse_json(raw)
@@ -343,29 +358,50 @@ def check_answer(body: dict):
     if not row:
         return {"error": "Session not found"}
 
-    question = json.loads(row[0])[question_idx]
-    marks    = question.get("marks", 1)
+    question    = json.loads(row[0])[question_idx]
+    marks       = question.get("marks", 1)
+    mark_scheme = question.get("mark_scheme", [question.get("answer", "")])
+    q_type      = question.get("type", "short")
 
-    prompt = f"""You are a strict but fair GCSE examiner.
+    scheme_lines = "\n".join(f"  • {p}" for p in mark_scheme)
+
+    prompt = f"""You are a strict CCEA GCSE examiner marking a student's answer against the official mark scheme.
 
 Question: {question["q"]}
-Correct answer: {question["answer"]}
-Student's answer: {student_ans}
+Question type: {q_type}
 Maximum marks: {marks}
 
-Assess the student's answer. Accept equivalent correct answers.
+Mark scheme — award 1 mark per bullet point if the student's answer includes that keyword/concept:
+{scheme_lines}
 
-Respond ONLY with JSON (no markdown):
+Student's answer: {student_ans}
+
+Marking rules:
+- For MCQ: award {marks} mark if student chose the correct option, else 0.
+- For short/calc: check EACH bullet independently. Award 1 mark per bullet if the student's
+  answer contains the required keyword, value, equation or concept (accept correct equivalents,
+  rearranged equations, alternative correct wording, and correct numerical answers with or
+  without full working shown).
+- Do NOT penalise spelling errors unless the word is unrecognisable.
+- is_correct = true only if marks_awarded equals {marks}.
+
+Return ONLY JSON (no markdown):
 {{
   "is_correct": true/false,
-  "marks_awarded": 0-{marks},
-  "feedback": "one-sentence feedback",
-  "explanation": "2-4 sentence explanation of the correct answer with working if calculation",
-  "tip": "one memorable tip or mnemonic to remember this"
+  "marks_awarded": 0–{marks},
+  "points": [
+    {{"text": "exact bullet from mark scheme", "awarded": true/false}}
+  ],
+  "feedback": "one-sentence overall feedback mentioning the score",
+  "explanation": "2–4 sentences explaining the full correct answer with any working",
+  "tip": "one memorable mnemonic or memory tip"
 }}"""
 
-    raw    = ask_claude(prompt, max_tokens=600)
+    raw    = ask_claude(prompt, max_tokens=700)
     result = parse_json(raw)
+
+    # Ensure is_correct reflects full marks
+    result["is_correct"] = result.get("marks_awarded", 0) >= marks
 
     con = db()
     con.execute(
@@ -726,7 +762,21 @@ input[type=text]:focus{border-color:#4fc3f7}
           font-size:14px;margin-top:6px}
 .feedback-box{margin-top:10px;padding:12px;border-radius:8px;font-size:13px;line-height:1.5}
 .fb-correct{background:#e8f5e9;border-left:4px solid #66bb6a}
+.fb-partial{background:#fff8e1;border-left:4px solid #ffa726}
 .fb-wrong{background:#fce4ec;border-left:4px solid #ef5350}
+.ms-box{margin-top:10px;background:rgba(0,0,0,.04);border-radius:6px;padding:8px 10px}
+.ms-list{list-style:none;margin:5px 0 0;padding:0}
+.ms-pt{display:flex;align-items:flex-start;gap:6px;padding:3px 0;font-size:12px;border-bottom:1px solid rgba(0,0,0,.05)}
+.ms-pt:last-child{border:none}
+.ms-icon{font-weight:900;font-size:13px;flex-shrink:0;width:16px}
+.ms-ok{color:#2e7d32}
+.ms-ok .ms-icon{color:#2e7d32}
+.ms-no{color:#c62828}
+.ms-no .ms-icon{color:#c62828}
+.ms-score{display:inline-block;background:#7986cb;color:white;border-radius:10px;
+          font-size:11px;padding:1px 7px;margin:0 6px 0 0;font-weight:700;vertical-align:middle}
+.ms-explain{margin-top:8px;font-size:12.5px;line-height:1.6;color:#333}
+.ms-tip{margin-top:6px;font-size:12px;color:#555;font-style:italic}
 .marks-badge{display:inline-block;background:#7986cb;color:white;border-radius:12px;
              font-size:11px;padding:2px 8px;margin-left:8px;font-weight:700}
 .score-bar{height:12px;background:#e0e0e0;border-radius:6px;overflow:hidden;margin:8px 0}
@@ -1288,14 +1338,18 @@ function getStudentAnswer(i){
 async function submitAll(){
   const btn=document.getElementById('submit-btn');
   loading(btn,'⏳ Checking…');
-  let correct=0, total=state.questions.length;
+  let awarded=0, possible=0;
 
-  for(let i=0;i<total;i++){
+  for(let i=0;i<state.questions.length;i++){
+    const q=state.questions[i];
+    const qMarks=q.marks||1;
+    possible+=qMarks;
     const ans=getStudentAnswer(i);
+    const fb=document.getElementById('fb-'+i);
+    fb.style.display='block';
     if(!ans){
-      document.getElementById('fb-'+i).style.display='block';
-      document.getElementById('fb-'+i).className='feedback-box fb-wrong';
-      document.getElementById('fb-'+i).innerHTML='<b>No answer provided.</b>';
+      fb.className='feedback-box fb-wrong';
+      fb.innerHTML='<b>No answer provided.</b>';
       continue;
     }
     try{
@@ -1304,29 +1358,43 @@ async function submitAll(){
         body:JSON.stringify({session_id:state.sessionId,question_idx:i,answer:ans})
       });
       const d=await r.json();
-      if(d.is_correct) correct++;
-      const fb=document.getElementById('fb-'+i);
-      fb.style.display='block';
-      fb.className='feedback-box '+(d.is_correct?'fb-correct':'fb-wrong');
-      fb.innerHTML=(d.is_correct?'✅ ':'❌ ')+'<b>'+d.feedback+'</b>'
-        +(d.is_correct?'':('<br><br><b>Explanation:</b> '+d.explanation
-          +'<br><br>💡 <b>Tip:</b> '+d.tip));
-    }catch(e){}
+      const got=d.marks_awarded||0;
+      awarded+=got;
+      const partial=got>0&&got<qMarks;
+      fb.className='feedback-box '+(d.is_correct?'fb-correct':partial?'fb-partial':'fb-wrong');
+
+      // Mark scheme points breakdown
+      let schemeHtml='';
+      if(d.points&&d.points.length){
+        schemeHtml='<div class="ms-box"><b>Mark scheme:</b><ul class="ms-list">'+
+          d.points.map(p=>`<li class="ms-pt ${p.awarded?'ms-ok':'ms-no'}">
+            <span class="ms-icon">${p.awarded?'✓':'✗'}</span>${p.text}</li>`).join('')+
+          '</ul></div>';
+      }
+
+      const scoreBadge=`<span class="ms-score">${got}/${qMarks}</span>`;
+      const icon=d.is_correct?'✅':partial?'🟡':'❌';
+      fb.innerHTML=`${icon} ${scoreBadge} <b>${d.feedback||''}</b>`+schemeHtml+
+        (got<qMarks?`<div class="ms-explain"><b>Full answer:</b> ${d.explanation||''}</div>`+
+         `<div class="ms-tip">💡 <b>Tip:</b> ${d.tip||''}</div>`:'');
+    }catch(e){fb.className='feedback-box fb-wrong';fb.innerHTML='<b>Error checking answer.</b>';}
   }
   done(btn);
-  showScore(correct, total);
+  showScore(awarded, possible);
 }
 
-function showScore(correct,total){
+function showScore(awarded,possible){
   const sc=document.getElementById('score-card');
   sc.style.display='block';
-  const pct=Math.round(correct/total*100);
+  const pct=possible>0?Math.round(awarded/possible*100):0;
   const grade=pct>=70?'🏆 Excellent!':pct>=55?'👍 Good effort':pct>=40?'📖 Keep revising':'💪 More practice needed';
   document.getElementById('score-summary').innerHTML=`
-    <div style="font-size:2rem;font-weight:700;color:#1a1a2e">${correct}/${total} <span style="font-size:1rem;color:#666">(${pct}%)</span></div>
+    <div style="font-size:2rem;font-weight:700;color:#1a1a2e">${awarded}/${possible}
+      <span style="font-size:1rem;color:#666;font-weight:400"> marks (${pct}%)</span></div>
     <div style="font-size:1.1rem;margin:6px 0">${grade}</div>
     <div class="score-bar"><div class="score-fill" style="width:${pct}%"></div></div>
-    <div style="font-size:13px;color:#666;margin-top:8px">Wrong answers show explanation + tip above — review them!</div>`;
+    <div style="font-size:13px;color:#666;margin-top:8px">
+      Coloured mark scheme below each answer — ✓ marks awarded, ✗ marks missed.</div>`;
   sc.scrollIntoView({behavior:'smooth'});
 }
 
