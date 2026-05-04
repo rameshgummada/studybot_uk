@@ -438,6 +438,174 @@ def quiz_summary(session_id: str):
     }
 
 
+# ── Predicted Papers ──────────────────────────────────────────────────────────
+
+@app.post("/predicted-papers/generate")
+def generate_predicted_papers(body: dict):
+    subject = body.get("subject", "chemistry")
+    force   = body.get("force", False)
+
+    con = db()
+    # Return cached papers unless force-regenerate requested
+    if not force:
+        existing = con.execute(
+            "SELECT paper_id, paper_number, title, questions_json, rationale, generated_at "
+            "FROM predicted_papers WHERE subject=? ORDER BY paper_number",
+            [subject]
+        ).fetchall()
+        if existing:
+            con.close()
+            return _format_predicted(subject, existing)
+
+    # Delete stale papers for this subject
+    con.execute("DELETE FROM predicted_papers WHERE subject=?", [subject])
+    con.close()
+
+    # Gather broad context: query several angles to get diverse chunks
+    ctx_parts = []
+    for q in [subject, "exam question calculation", "definition formula", "describe explain"]:
+        chunk = search_context(subject, q, n=12)
+        if chunk:
+            ctx_parts.append(chunk)
+    ctx_block = ("\n\n".join(ctx_parts[:3])[:6000]) if ctx_parts else \
+                "(No indexed documents — generating from CCEA GCSE curriculum knowledge)"
+
+    subj_label = subject.replace("_", " ").upper()
+
+    prompt = f"""You are a senior CCEA GCSE {subj_label} examiner producing five predicted model papers.
+
+You have studied the following content extracted from real past papers for {subj_label}:
+---
+{ctx_block}
+---
+
+Task:
+Analyse the content above. Identify:
+- Topics that recur frequently (mark as "HIGH" likelihood)
+- Core curriculum topics tested almost every year ("HIGH")
+- Topics seen once or twice ("MEDIUM")
+- Topics that haven't appeared recently but are in syllabus ("WATCH")
+
+Then generate EXACTLY 5 predicted papers. Each paper must have EXACTLY 10 questions
+covering a balanced spread of the syllabus, mixing:
+- 4 MCQ questions (type "mcq", 1 mark each, options A–D)
+- 4 short-answer questions (type "short", 2–3 marks each)
+- 2 calculation questions (type "calc", 3–5 marks each)
+
+Each question MUST include:
+- A realistic mark scheme (one bullet per mark, keyword/phrase the examiner accepts)
+- The topic name it tests
+- A likelihood rating: "HIGH", "MEDIUM", or "WATCH"
+
+Vary the questions across the 5 papers so students see the full syllabus.
+
+Return ONLY a valid JSON array of exactly 5 objects (no markdown, no explanation):
+[
+  {{
+    "paper_number": 1,
+    "title": "Predicted Paper 1 — {subj_label}",
+    "rationale": "2-sentence explanation of the focus of this paper and why these topics are predicted",
+    "questions": [
+      {{
+        "q": "Full exam question text",
+        "type": "mcq",
+        "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+        "answer": "correct option letter and text",
+        "mark_scheme": ["Correct: A) ..."],
+        "marks": 1,
+        "topic": "Topic Name",
+        "likelihood": "HIGH"
+      }},
+      {{
+        "q": "Full exam question text",
+        "type": "short",
+        "answer": "full correct answer",
+        "mark_scheme": ["keyword for mark 1", "keyword for mark 2"],
+        "marks": 2,
+        "topic": "Topic Name",
+        "likelihood": "MEDIUM"
+      }}
+    ]
+  }}
+]
+Rules: omit "options" for non-mcq. mark_scheme length MUST equal marks."""
+
+    raw  = ask_claude(prompt, max_tokens=7000)
+    papers = parse_json(raw)
+
+    con = db()
+    now = datetime.now()
+    for p in papers:
+        con.execute(
+            "INSERT INTO predicted_papers (paper_id, subject, paper_number, title, questions_json, rationale, generated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [str(uuid.uuid4()), subject, p["paper_number"], p["title"],
+             json.dumps(p["questions"]), p.get("rationale", ""), now]
+        )
+    con.close()
+    return {"subject": subject, "papers": papers, "generated": True,
+            "generated_at": str(now)[:16]}
+
+
+def _format_predicted(subject: str, rows):
+    papers = []
+    for r in rows:
+        qs = json.loads(r[3])
+        papers.append({
+            "paper_id":      r[0],
+            "paper_number":  r[1],
+            "title":         r[2],
+            "questions":     qs,
+            "rationale":     r[4],
+            "generated_at":  str(r[5])[:16],
+            "total_marks":   sum(q.get("marks", 1) for q in qs),
+            "question_count": len(qs),
+        })
+    return {"subject": subject, "papers": papers, "generated": False,
+            "generated_at": papers[0]["generated_at"] if papers else ""}
+
+
+@app.get("/predicted-papers/{subject}")
+def get_predicted_papers(subject: str):
+    con = db()
+    rows = con.execute(
+        "SELECT paper_id, paper_number, title, questions_json, rationale, generated_at "
+        "FROM predicted_papers WHERE subject=? ORDER BY paper_number",
+        [subject]
+    ).fetchall()
+    con.close()
+    if not rows:
+        return {"subject": subject, "papers": [], "generated_at": ""}
+    return _format_predicted(subject, rows)
+
+
+@app.post("/quiz/from-paper")
+def quiz_from_paper(body: dict):
+    paper_id   = body.get("paper_id")
+    student_id = body.get("student_id", "")
+
+    con = db()
+    row = con.execute(
+        "SELECT subject, title, questions_json FROM predicted_papers WHERE paper_id=?",
+        [paper_id]
+    ).fetchone()
+    con.close()
+    if not row:
+        return {"error": "Paper not found"}
+
+    questions  = json.loads(row[2])
+    session_id = str(uuid.uuid4())
+    con = db()
+    con.execute(
+        "INSERT INTO quiz_sessions (session_id,subject,topic,question_count,questions_json,created_at,student_id) "
+        "VALUES (?,?,?,?,?,?,?)",
+        [session_id, row[0], row[1], len(questions), row[2], datetime.now(), student_id]
+    )
+    con.close()
+    return {"session_id": session_id, "questions": questions,
+            "subject": row[0], "topic": row[1]}
+
+
 @app.get("/flashcards/{subject}")
 def flashcards(subject: str, topic: str = ""):
     context = search_context(subject, topic or subject, n=12)
@@ -891,6 +1059,29 @@ input[type=text]:focus{border-color:#4fc3f7}
 .perf-sub-tab{flex:1;padding:7px;text-align:center;cursor:pointer;font-size:13px;font-weight:600;
               color:#888;border-radius:6px;transition:.2s}
 .perf-sub-tab.active{background:white;color:#0288d1;box-shadow:0 1px 4px rgba(0,0,0,.1)}
+.pred-paper-card{background:white;border-radius:12px;margin-bottom:14px;
+                 box-shadow:0 2px 8px rgba(0,0,0,.07);overflow:hidden}
+.pred-paper-hdr{display:flex;align-items:center;gap:14px;padding:18px 20px;cursor:pointer;transition:.15s}
+.pred-paper-hdr:hover{background:#f8f9ff}
+.pred-paper-title{font-size:1rem;font-weight:700;color:#1a1a2e;margin-bottom:5px}
+.pred-paper-meta{font-size:12px;color:#888;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.pred-paper-body{border-top:1px solid #eee;padding:18px 20px}
+.pred-rationale{font-size:13px;color:#555;background:#f8f9ff;border-left:4px solid #7986cb;
+                padding:10px 14px;border-radius:0 8px 8px 0;margin-bottom:16px;line-height:1.6}
+.pred-q-row{border:1.5px solid #e8ecff;border-radius:8px;padding:14px;margin-bottom:10px;background:#fafbff}
+.pred-q-meta{display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap}
+.pred-q-num{font-size:11px;font-weight:700;color:#7986cb;background:#e8ecff;
+            padding:2px 7px;border-radius:4px}
+.pred-q-text{font-size:13.5px;font-weight:600;line-height:1.5;color:#1a1a2e;margin-bottom:8px}
+.pred-q-opts{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+.pred-opt{font-size:12px;padding:3px 10px;background:#f0f2f5;border-radius:6px;color:#555}
+.pred-ms{font-size:12px;color:#555;background:#f0f8ff;border-radius:6px;padding:8px 10px;border-left:3px solid #b3e5fc}
+.pred-ms-list{margin:4px 0 0 16px;padding:0}
+.pred-ms-list li{margin:2px 0;color:#333}
+.lh-HIGH{background:#ffcdd2;color:#b71c1c;border-radius:8px;padding:2px 7px;font-size:11px;font-weight:700}
+.lh-MEDIUM{background:#fff9c4;color:#e65100;border-radius:8px;padding:2px 7px;font-size:11px;font-weight:700}
+.lh-WATCH{background:#e3f2fd;color:#0d47a1;border-radius:8px;padding:2px 7px;font-size:11px;font-weight:700}
+.pred-arrow{font-size:20px;color:#bbb;transition:transform .25s;display:inline-block}
 </style>
 </head>
 <body>
@@ -929,6 +1120,7 @@ input[type=text]:focus{border-color:#4fc3f7}
   <div class="tab" onclick="showPage('upload',this)">⬆️ Upload</div>
   <div class="tab" onclick="showPage('stats',this)">📊 Stats</div>
   <div class="tab" onclick="showPage('perf',this)">📈 Performance</div>
+  <div class="tab" onclick="showPage('predicted',this)">📋 Predicted Papers</div>
 </div>
 
 <!-- AUTH MODAL -->
@@ -1239,6 +1431,44 @@ input[type=text]:focus{border-color:#4fc3f7}
   </div>
 </div>
 
+<!-- PREDICTED PAPERS PAGE -->
+<div class="page" id="page-predicted">
+  <div class="card">
+    <h2 style="margin-bottom:8px">📋 Predicted Papers</h2>
+    <p style="font-size:13px;color:#666;margin-bottom:16px;line-height:1.6">
+      AI-generated model papers built by analysing your indexed past papers.<br>
+      Questions are selected based on topic frequency, exam importance and predicted likelihood of appearing this year.
+    </p>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <button class="btn btn-primary" id="pred-gen-btn" onclick="generatePredicted(false)">
+        🔮 Generate 5 Papers — <span id="pred-subj-label">Chemistry</span>
+      </button>
+      <button class="btn btn-warn" id="pred-regen-btn" style="display:none" onclick="generatePredicted(true)">
+        🔄 Regenerate
+      </button>
+      <span id="pred-gen-date" style="font-size:12px;color:#aaa"></span>
+    </div>
+    <div style="margin-top:12px;font-size:12px;color:#aaa;display:flex;gap:16px;flex-wrap:wrap">
+      <span><span class="lh-HIGH">HIGH</span> Appeared 3+ times / core topic</span>
+      <span><span class="lh-MEDIUM">MEDIUM</span> Seen 1–2 times</span>
+      <span><span class="lh-WATCH">WATCH</span> Due to appear — not seen recently</span>
+    </div>
+  </div>
+
+  <div id="pred-loading" style="display:none;text-align:center;padding:50px 20px;color:#888">
+    <div style="font-size:2.5rem;margin-bottom:14px">🔮</div>
+    <div style="font-size:15px;font-weight:600;margin-bottom:8px">Analysing past papers…</div>
+    <div style="font-size:13px">Identifying repeated topics, critical questions and exam patterns.<br>
+    Generating 5 predicted papers — this takes 30–60 seconds.</div>
+  </div>
+
+  <div id="pred-empty" style="display:none;text-align:center;padding:40px;color:#aaa;font-size:14px">
+    No papers generated yet. Select a subject above and click Generate.
+  </div>
+
+  <div id="pred-papers-area"></div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -1249,11 +1479,12 @@ function selSubject(el, subject){
   document.querySelectorAll('#gs-group .gs-pill').forEach(p=>p.classList.remove('sel'));
   el.classList.add('sel');
   state.subject = subject;
-  // keep upload label in sync
   const lbl = document.getElementById('upload-subj-label');
   if(lbl) lbl.innerText = el.innerText.trim();
-  // if notes tab is open, reload units immediately
+  const predLbl = document.getElementById('pred-subj-label');
+  if(predLbl) predLbl.innerText = el.innerText.trim();
   if(document.getElementById('page-notes').classList.contains('active')) loadUnits();
+  if(document.getElementById('page-predicted').classList.contains('active')) loadPredicted();
 }
 
 function showPage(name, tab){
@@ -1261,8 +1492,9 @@ function showPage(name, tab){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
   tab.classList.add('active');
-  if(name==='notes') loadUnits();
-  if(name==='perf')  loadPerformance();
+  if(name==='notes')     loadUnits();
+  if(name==='perf')      loadPerformance();
+  if(name==='predicted') loadPredicted();
 }
 
 function selPill(el, groupId, val){
@@ -1818,6 +2050,140 @@ function drawSparkline(scores){
     ctx.beginPath(); ctx.arc(x,y,4,0,2*Math.PI);
     ctx.fillStyle=v>=55?'#66bb6a':'#ef5350'; ctx.fill();
   });
+}
+
+// ── PREDICTED PAPERS ──────────────────────────────────────────────────────────
+async function loadPredicted(){
+  document.getElementById('pred-empty').style.display='none';
+  document.getElementById('pred-papers-area').innerHTML='';
+  document.getElementById('pred-regen-btn').style.display='none';
+  document.getElementById('pred-gen-date').innerText='';
+  try{
+    const r=await fetch('/predicted-papers/'+state.subject);
+    const d=await r.json();
+    if(!d.papers||!d.papers.length){
+      document.getElementById('pred-empty').style.display='block';
+    } else {
+      renderPredictedPapers(d.papers);
+      document.getElementById('pred-regen-btn').style.display='inline-block';
+      document.getElementById('pred-gen-date').innerText='Generated: '+d.generated_at;
+    }
+  }catch(e){}
+}
+
+async function generatePredicted(force){
+  const btn=document.getElementById('pred-gen-btn');
+  loading(btn,'⏳ Analysing…');
+  document.getElementById('pred-loading').style.display='block';
+  document.getElementById('pred-papers-area').innerHTML='';
+  document.getElementById('pred-empty').style.display='none';
+  document.getElementById('pred-regen-btn').style.display='none';
+  document.getElementById('pred-gen-date').innerText='';
+  try{
+    const r=await fetch('/predicted-papers/generate',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({subject:state.subject,force:!!force})
+    });
+    const d=await r.json();
+    if(d.papers&&d.papers.length){
+      renderPredictedPapers(d.papers);
+      document.getElementById('pred-regen-btn').style.display='inline-block';
+      document.getElementById('pred-gen-date').innerText='Generated: '+(d.generated_at||'just now');
+      toast('✅ 5 predicted papers ready!');
+    } else {
+      document.getElementById('pred-empty').style.display='block';
+    }
+  }catch(e){toast('❌ '+e.message);}
+  finally{done(btn);document.getElementById('pred-loading').style.display='none';}
+}
+
+function renderPredictedPapers(papers){
+  const area=document.getElementById('pred-papers-area');
+  area.innerHTML=papers.map((p,idx)=>{
+    const qs=p.questions||[];
+    const total=p.total_marks||qs.reduce((s,q)=>s+(q.marks||1),0);
+    const high=qs.filter(q=>q.likelihood==='HIGH').length;
+    const med=qs.filter(q=>q.likelihood==='MEDIUM').length;
+    const watch=qs.filter(q=>q.likelihood==='WATCH').length;
+    const pid=p.paper_id||'';
+    return `
+<div class="pred-paper-card">
+  <div class="pred-paper-hdr" onclick="togglePaper(${idx})">
+    <div style="flex:1;min-width:0">
+      <div class="pred-paper-title">${p.title||'Predicted Paper '+(idx+1)}</div>
+      <div class="pred-paper-meta">
+        ${qs.length} questions &nbsp;·&nbsp; ${total} marks
+        &nbsp;&nbsp;
+        <span class="lh-HIGH">${high} High</span>
+        <span class="lh-MEDIUM">${med} Medium</span>
+        <span class="lh-WATCH">${watch} Watch</span>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-shrink:0">
+      <button class="btn btn-primary" style="font-size:13px;padding:7px 16px"
+              onclick="event.stopPropagation();takePaper('${pid}')">
+        📝 Take Paper
+      </button>
+      <span class="pred-arrow" id="pred-arrow-${idx}">›</span>
+    </div>
+  </div>
+  <div class="pred-paper-body" id="pred-body-${idx}" style="display:none">
+    <div class="pred-rationale">💡 ${p.rationale||''}</div>
+    <div>
+      ${qs.map((q,qi)=>{
+        const opts=q.type==='mcq'&&q.options?
+          '<div class="pred-q-opts">'+q.options.map(o=>`<span class="pred-opt">${o}</span>`).join('')+'</div>':'';
+        const ms='<div class="pred-ms"><b>Mark scheme:</b><ul class="pred-ms-list">'+
+          (q.mark_scheme||[q.answer||'']).map(s=>`<li>${s}</li>`).join('')+'</ul></div>';
+        return `<div class="pred-q-row">
+          <div class="pred-q-meta">
+            <span class="pred-q-num">Q${qi+1}</span>
+            <span class="marks-badge">${q.marks||1}m</span>
+            <span class="lh-${q.likelihood||'MEDIUM'}">${q.likelihood||'MEDIUM'}</span>
+            <span style="font-size:11px;color:#999">${q.topic||''}</span>
+          </div>
+          <div class="pred-q-text">${q.q}</div>
+          ${opts}${ms}
+        </div>`;
+      }).join('')}
+    </div>
+  </div>
+</div>`;
+  }).join('');
+}
+
+function togglePaper(idx){
+  const body=document.getElementById('pred-body-'+idx);
+  const arrow=document.getElementById('pred-arrow-'+idx);
+  const open=body.style.display!=='none';
+  body.style.display=open?'none':'block';
+  arrow.style.transform=open?'':'rotate(90deg)';
+}
+
+async function takePaper(paperId){
+  if(!paperId){toast('❌ Paper ID missing');return;}
+  try{
+    const r=await fetch('/quiz/from-paper',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paper_id:paperId,student_id:state.student?state.student.student_id:''})
+    });
+    const d=await r.json();
+    if(d.error){toast('❌ '+d.error);return;}
+    state.sessionId=d.session_id;
+    state.questions=d.questions;
+    // Switch to Quiz tab
+    document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    document.getElementById('page-quiz').classList.add('active');
+    document.querySelector('.tabs .tab').classList.add('active');
+    // Reset quiz area with paper questions
+    document.getElementById('quiz-area').innerHTML='';
+    document.getElementById('score-card').style.display='none';
+    document.getElementById('submit-btn').style.display='inline-block';
+    renderQuestions(d.questions);
+    window.scrollTo({top:0,behavior:'smooth'});
+    toast('📋 '+d.topic+' loaded — answer all questions then Submit!');
+  }catch(e){toast('❌ '+e.message);}
 }
 
 </script>

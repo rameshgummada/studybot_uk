@@ -100,6 +100,17 @@ def init_db(con: duckdb.DuckDBPyConnection):
             answered_at    TIMESTAMP
         )
     """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS predicted_papers (
+            paper_id       VARCHAR PRIMARY KEY,
+            subject        VARCHAR,
+            paper_number   INTEGER,
+            title          VARCHAR,
+            questions_json TEXT,
+            rationale      TEXT,
+            generated_at   TIMESTAMP
+        )
+    """)
 
 
 def _chunks(text: str):
