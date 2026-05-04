@@ -446,7 +446,6 @@ def generate_predicted_papers(body: dict):
     force   = body.get("force", False)
 
     con = db()
-    # Return cached papers unless force-regenerate requested
     if not force:
         existing = con.execute(
             "SELECT paper_id, paper_number, title, questions_json, rationale, generated_at "
@@ -457,94 +456,106 @@ def generate_predicted_papers(body: dict):
             con.close()
             return _format_predicted(subject, existing)
 
-    # Delete stale papers for this subject
     con.execute("DELETE FROM predicted_papers WHERE subject=?", [subject])
     con.close()
 
-    # Gather broad context: query several angles to get diverse chunks
+    # Broad context from multiple angles
     ctx_parts = []
-    for q in [subject, "exam question calculation", "definition formula", "describe explain"]:
-        chunk = search_context(subject, q, n=12)
+    for q in [subject, "exam calculation formula", "definition describe explain", "graph data table"]:
+        chunk = search_context(subject, q, n=10)
         if chunk:
             ctx_parts.append(chunk)
-    ctx_block = ("\n\n".join(ctx_parts[:3])[:6000]) if ctx_parts else \
-                "(No indexed documents — generating from CCEA GCSE curriculum knowledge)"
+    ctx_block = ("\n\n".join(ctx_parts[:3])[:5000]) if ctx_parts else \
+                "(No indexed documents — use CCEA GCSE curriculum knowledge)"
 
     subj_label = subject.replace("_", " ").upper()
 
-    prompt = f"""You are a senior CCEA GCSE {subj_label} examiner producing five predicted model papers.
+    # Generate one paper at a time to avoid JSON truncation
+    all_papers_raw = []
+    used_topics: list = []
 
-You have studied the following content extracted from real past papers for {subj_label}:
+    for paper_num in range(1, 6):
+        avoid = (", ".join(used_topics[-8:]) if used_topics else "none yet")
+        prompt = f"""You are a CCEA GCSE {subj_label} examiner writing Predicted Paper {paper_num} of 5.
+
+Reference material from past papers:
 ---
 {ctx_block}
 ---
 
-Task:
-Analyse the content above. Identify:
-- Topics that recur frequently (mark as "HIGH" likelihood)
-- Core curriculum topics tested almost every year ("HIGH")
-- Topics seen once or twice ("MEDIUM")
-- Topics that haven't appeared recently but are in syllabus ("WATCH")
+Topics already covered in previous papers (vary from these): {avoid}
 
-Then generate EXACTLY 5 predicted papers. Each paper must have EXACTLY 10 questions
-covering a balanced spread of the syllabus, mixing:
-- 4 MCQ questions (type "mcq", 1 mark each, options A–D)
-- 4 short-answer questions (type "short", 2–3 marks each)
-- 2 calculation questions (type "calc", 3–5 marks each)
+Generate exactly 8 questions for this paper:
+- 3 MCQ (type "mcq", 1 mark, options A-D)
+- 3 short-answer (type "short", 2-3 marks)
+- 2 calculations (type "calc", 3-4 marks)
 
-Each question MUST include:
-- A realistic mark scheme (one bullet per mark, keyword/phrase the examiner accepts)
-- The topic name it tests
-- A likelihood rating: "HIGH", "MEDIUM", or "WATCH"
+For EACH question include a mark_scheme array — one item per mark containing the
+keyword/phrase an examiner accepts for that mark.
 
-Vary the questions across the 5 papers so students see the full syllabus.
+Label each question with:
+  "likelihood": "HIGH" (topic appears in many past papers / core syllabus)
+             | "MEDIUM" (seen once or twice)
+             | "WATCH" (overdue — not tested recently)
 
-Return ONLY a valid JSON array of exactly 5 objects (no markdown, no explanation):
-[
-  {{
-    "paper_number": 1,
-    "title": "Predicted Paper 1 — {subj_label}",
-    "rationale": "2-sentence explanation of the focus of this paper and why these topics are predicted",
-    "questions": [
-      {{
-        "q": "Full exam question text",
-        "type": "mcq",
-        "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
-        "answer": "correct option letter and text",
-        "mark_scheme": ["Correct: A) ..."],
-        "marks": 1,
-        "topic": "Topic Name",
-        "likelihood": "HIGH"
-      }},
-      {{
-        "q": "Full exam question text",
-        "type": "short",
-        "answer": "full correct answer",
-        "mark_scheme": ["keyword for mark 1", "keyword for mark 2"],
-        "marks": 2,
-        "topic": "Topic Name",
-        "likelihood": "MEDIUM"
-      }}
-    ]
-  }}
-]
+Return ONLY valid JSON (no markdown):
+{{
+  "paper_number": {paper_num},
+  "title": "Predicted Paper {paper_num} — {subj_label}",
+  "rationale": "Two sentences on why these topics were chosen for this paper.",
+  "questions": [
+    {{
+      "q": "Full question text",
+      "type": "mcq",
+      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
+      "answer": "A) correct option text",
+      "mark_scheme": ["Correct: A) option text"],
+      "marks": 1,
+      "topic": "Topic name",
+      "likelihood": "HIGH"
+    }}
+  ]
+}}
 Rules: omit "options" for non-mcq. mark_scheme length MUST equal marks."""
 
-    raw  = ask_claude(prompt, max_tokens=7000)
-    papers = parse_json(raw)
+        try:
+            raw = ask_claude(prompt, max_tokens=3500)
+            paper = parse_json(raw)
+            # Normalise — some Claude responses wrap in a list
+            if isinstance(paper, list):
+                paper = paper[0]
+            all_papers_raw.append(paper)
+            used_topics += [q.get("topic", "") for q in paper.get("questions", [])]
+        except Exception as e:
+            # Build a minimal placeholder so we always return 5 papers
+            all_papers_raw.append({
+                "paper_number": paper_num,
+                "title": f"Predicted Paper {paper_num} — {subj_label}",
+                "rationale": "Could not generate this paper. Try regenerating.",
+                "questions": []
+            })
 
     con = db()
     now = datetime.now()
-    for p in papers:
+    for p in all_papers_raw:
         con.execute(
-            "INSERT INTO predicted_papers (paper_id, subject, paper_number, title, questions_json, rationale, generated_at) "
+            "INSERT INTO predicted_papers "
+            "(paper_id, subject, paper_number, title, questions_json, rationale, generated_at) "
             "VALUES (?,?,?,?,?,?,?)",
-            [str(uuid.uuid4()), subject, p["paper_number"], p["title"],
-             json.dumps(p["questions"]), p.get("rationale", ""), now]
+            [str(uuid.uuid4()), subject,
+             p.get("paper_number", 0), p.get("title", ""),
+             json.dumps(p.get("questions", [])),
+             p.get("rationale", ""), now]
         )
+
+    # Fetch back with paper_ids so frontend can use "Take Paper"
+    rows = con.execute(
+        "SELECT paper_id, paper_number, title, questions_json, rationale, generated_at "
+        "FROM predicted_papers WHERE subject=? ORDER BY paper_number",
+        [subject]
+    ).fetchall()
     con.close()
-    return {"subject": subject, "papers": papers, "generated": True,
-            "generated_at": str(now)[:16]}
+    return _format_predicted(subject, rows) | {"generated": True}
 
 
 def _format_predicted(subject: str, rows):
